@@ -1273,6 +1273,7 @@
         if (hp.length)
           h += `<table>${hp.map(([k, v]) => `<tr><td class="mono">${esc(k)}</td><td class="mono">${esc(fv(v))}</td></tr>`).join("")}</table>`;
         if (n.kind === "op" && OP_DOC[n.type]) h += `<div class="muted">${esc(OP_DOC[n.type])}</div>`;
+        if (n.kind === "learning" && n.doc) h += `<div class="muted">${esc(n.doc)}</div>`;
         if (n.only)
           h += `<div class="deltanote">${S.phase === "train" ? "exists only while training" : "not present while training"}</div>`;
         return h + (n.act ? `<div class="muted">click to open the next level</div>` : "");
@@ -2147,13 +2148,30 @@
           lay.nodes.forEach((n) => (n.x += shiftX));
           lay.edges.forEach((e) => {
             e.lx += shiftX;
-            if (e.d) e.d = e.d.replace(/([MLCQ])\s*([-\d.]+),([-\d.]+)/g, (_, cmd, x, y) => `${cmd}${+x + shiftX},${y}`);
+            if (e.d) e.d = e.d.replace(/([-\d.]+),([-\d.]+)/g, (_, x, y) => `${+x + shiftX},${y}`);
           });
         }
 
-        const add = (key, title, sub, x, y, fam) => {
+        const add = (key, title, sub, x, y, fam, meta = {}) => {
           const id = `${prefix}learn_${key}`;
-          const node = { id, j: id, title, type: title, sub, x, y, w: W, h: H, fam, kind: "learning", ctx: {} };
+          const node = {
+            id,
+            j: id,
+            title,
+            type: title,
+            sub,
+            x,
+            y,
+            w: W,
+            h: H,
+            fam,
+            kind: "learning",
+            shape: meta.shape || "",
+            hp: meta.hp || {},
+            doc: meta.doc || "",
+            owner: meta.owner || null,
+            ctx: {},
+          };
           lay.nodes.push(node);
           return node;
         };
@@ -2170,27 +2188,33 @@
         let boxSrc = boxOut;
         if (graph.decode) {
           const decX = Math.max(0, Math.min(totalW - W, boxOut.x + boxOut.w / 2 - W / 2));
-          boxSrc = add("decode", graph.decode.name, graph.decode.detail, decX, yCur, "head");
+          boxSrc = add("decode", graph.decode.name, graph.decode.detail, decX, yCur, "head", graph.decode);
           connect(boxOut, boxSrc);
           yCur += H + rankGap;
         }
 
-        const assign = add("assign", graph.assigner, "target assignment", (totalW - W) / 2, yCur, "attn");
+        const assign = add("assign", graph.assigner, "target assignment", (totalW - W) / 2, yCur, "attn", graph.assigner_info || {});
         connect(boxSrc, assign);
         if (clsOut !== boxOut) connect(clsOut, assign);
 
         const yLoss = yCur + H + rankGap;
         const lossLeft = (totalW - rowW) / 2;
         const lossNodes = losses.map((v, i) => {
-          const ln = add(`l${i}`, v.name, v.detail, lossLeft + i * (W + gap), yLoss, v.kind === "cls" ? "conv" : "head");
+          const ln = add(`l${i}`, v.name, v.detail, lossLeft + i * (W + gap), yLoss, v.kind === "cls" ? "conv" : "head", v);
           connect(assign, ln);
-          if (v.kind === "cls") connect(clsOut, ln);
+          if (v.input_from === "raw_box") connect(boxOut, ln);
+          else if (v.input_from === "cls" || v.kind === "cls") connect(clsOut, ln);
           else connect(boxSrc, ln);
           return ln;
         });
 
         const yLoop = yLoss + H + rankGap;
-        const loopNode = add("loop", "Backward + Optimizer", loopSub, (totalW - W) / 2, yLoop, "norm");
+        const loopNode = add("loop", "Backward + Optimizer", loopSub, (totalW - W) / 2, yLoop, "norm", {
+          shape: "total loss → grad → step",
+          hp: { trainer: l.trainer?.name, validator: l.validator?.name, metric: l.metric },
+          owner: l.trainer,
+          doc: "Backpropagates summed box + cls (+ dfl) losses, updates weights, and evaluates mAP on validation.",
+        });
         lossNodes.forEach((ln) => connect(ln, loopNode));
 
         lay.w = totalW;
@@ -2219,9 +2243,11 @@
             }
           }
           const variants = layer && V(layer).length > 1 ? V(layer) : [];
+          const hg = isHeadChain ? cfg.learning.head_graph : null;
+          const headNums = hg ? `nl=${hg.nl} · ${hg.anchors} anchors · reg_max=${hg.reg_max} · nc=${hg.nc}` : "";
           const subT =
             (ci === 0
-              ? `${b.owner} internals${isHeadChain ? " + learning losses" : ""} · ${S.cfg}`
+              ? `${b.owner} internals${headNums ? ` · ${headNums}` : ""} · ${S.cfg}`
               : `inside ${DATA.blocks[S.cards[ci - 1].key].owner} · level ${ci + 1}`) +
             ` · ${PHASE_LABEL[S.phase]}` +
             (nOnly
@@ -2512,7 +2538,12 @@
         const box = (label, text, cls = "") => `<div style="border:1px solid #9aa8b5;border-radius:6px;padding:7px 9px;background:var(--${cls || "head"});min-width:110px;text-align:center"><b>${esc(label)}</b><br><span class="muted" style="font-size:11px">${esc(text)}</span></div>`;
         let h = `<h3>Learning graph · ${esc(l.head_graph.name)}</h3><p class="muted" style="font-size:12px">Separate from inference: each detection level keeps box and class branches distinct, then feeds the shared target assignment and named loss terms actually used by this criterion.</p>`;
         h += `<div style="display:flex;align-items:center;gap:7px;overflow-x:auto;padding:6px 0">`;
-        h += l.head_graph.levels.map((x) => `<div style="display:flex;flex-direction:column;gap:4px">${box(`${x.name} · box`, x.box, "head")}${box(`${x.name} · cls`, x.cls, "conv")}</div>`).join(`<span style="padding:0 3px">＋</span>`);
+        h += l.head_graph.levels
+          .map((x) => {
+            const hdr = x.stride ? `${x.name} · s=${x.stride} (${x.anchors})` : x.name;
+            return `<div style="display:flex;flex-direction:column;gap:4px">${box(`${hdr} · box`, x.box, "head")}${box(`${hdr} · cls`, x.cls, "conv")}</div>`;
+          })
+          .join(`<span style="padding:0 3px">＋</span>`);
         h += `<span>→</span>${box(l.head_graph.assigner, "target assignment", "attn")}<span>→</span><div style="display:grid;grid-template-columns:repeat(${Math.max(1, l.losses.length)},minmax(105px,1fr));gap:6px">${l.losses.map((x) => box(x.name, x.detail, x.kind === "cls" ? "conv" : "head")).join("")}</div></div>`;
         h += `<p style="font-size:12px"><b>Criterion:</b> ${ref(l.criterion)} · <b>Validation:</b> ${ref(l.validator)} · <b>Metric:</b> <span class="mono">${esc(l.metric)}</span> · <b>dataset:</b> <span class="mono">${esc(l.dataset)}</span></p>`;
         h += `<details><summary>Training method owners</summary><table><tr><th>stage</th><th>owner</th></tr>${l.steps.map((s) => `<tr><td>${esc(s.name)}</td><td>${ref(s.owner)}</td></tr>`).join("")}</table></details>`;
@@ -2572,7 +2603,20 @@
       }
       function nodePanel(cfg, n) {
         if (n.kind === "learning") {
-          return `<h2>${esc(n.title)}</h2><p class="mono muted">${esc(n.sub || "")}</p>${learningHTML(cfg)}`;
+          const hp = Object.entries(n.hp || {}).filter(([, v]) => v != null && v !== "");
+          const own = n.owner
+            ? `<p style="font-size:12px"><b>Owner:</b> <span class="mono">${esc(n.owner.name)}</span>${n.owner.file ? ` <span class="muted">(${esc(n.owner.file)}:${n.owner.line})</span>` : ""}</p>`
+            : "";
+          return (
+            `<h2>${esc(n.title)}</h2><p class="mono muted">${esc(n.sub || "")}</p>` +
+            (n.doc ? `<p>${esc(n.doc)}</p>` : "") +
+            (n.shape ? `<h3>Tensor shape</h3><p class="mono">${esc(n.shape)}</p>` : "") +
+            (hp.length
+              ? `<h3>Parameters</h3><table>${hp.map(([k, v]) => `<tr><td class="mono">${esc(k)}</td><td class="mono">${esc(fv(v))}</td></tr>`).join("")}</table>`
+              : "") +
+            own +
+            learningHTML(cfg)
+          );
         }
         let h = `<h2>${esc(n.type)} ${n.name ? `<span class="muted mono" style="font-weight:400">${esc(n.name)}</span>` : ""}</h2>`;
         h += `<p>${famDot(n.fam)}${FAM_LABEL[n.fam] || ""}${n.stack ? ` · repeated n = ${esc(n.hp.n || "")} times (chained)` : ""}</p>`;

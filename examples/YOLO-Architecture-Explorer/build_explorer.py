@@ -151,21 +151,66 @@ def learning_loop(model: DetectionModel) -> dict:
     is_rtdetr = head_name == "RTDETRDecoder"
     levels = getattr(head, "nl", len(getattr(head, "cv2", getattr(head, "strides", [])))) or 3
     strides = getattr(head, "stride", getattr(head, "strides", None))
+    nc = int(getattr(head, "nc", model.yaml.get("nc", 80)))
     if strides is not None and len(strides) == levels:
-        level_names = [f"P{round(math.log2(float(s)))}" for s in strides]
+        stride_vals = [int(float(s)) for s in strides]
+        level_names = [f"P{round(math.log2(s))}" for s in stride_vals]
+        level_anchors = [(640 // s) ** 2 for s in stride_vals]
     else:
+        stride_vals = [2 ** (i + 3) for i in range(levels)]
         level_names = [f"P{i + 3}" for i in range(levels)]
+        level_anchors = [(640 // s) ** 2 for s in stride_vals]
+    total_anchors = int(getattr(head, "num_queries", sum(level_anchors))) if is_rtdetr else sum(level_anchors)
 
     if is_rtdetr:
-        criterion = RTDETRDetectionLoss(nc=getattr(head, "nc", model.yaml.get("nc", 80)), use_vfl=True)
+        criterion = RTDETRDetectionLoss(nc=nc, use_vfl=True)
         trainer, validator = RTDETRTrainer, RTDETRValidator
-        assigner_name = type(criterion.matcher).__name__
+        assigner_obj = criterion.matcher
+        assigner_name = type(assigner_obj).__name__
+        assigner_info = {
+            "name": assigner_name,
+            "shape": f"B×{total_anchors}×4 + B×{total_anchors}×{nc} → matched pairs",
+            "hp": {"queries": total_anchors, "nc": nc},
+            "owner": _source_ref(assigner_obj),
+            "doc": "One-to-one bipartite matching between decoder queries and ground-truth objects.",
+        }
         decode = None
-        branches = [{"name": name, "box": "query box (cx,cy,w,h)", "cls": "query class logits"} for name in level_names]
+        reg_max = 1
+        branches = [
+            {"name": name, "stride": s, "anchors": a, "box": "query box (cx,cy,w,h)", "cls": f"query cls ({nc})"}
+            for name, s, a in zip(level_names, stride_vals, level_anchors)
+        ]
         losses = [
-            {"name": "L1", "kind": "box", "detail": "Bbox L1 loss"},
-            {"name": "GIoU", "kind": "box", "detail": "1 − GIoU"},
-            {"name": "VFL", "kind": "cls", "detail": "varifocal class loss"},
+            {
+                "name": "L1",
+                "kind": "box",
+                "input_from": "decode",
+                "detail": "Bbox L1 loss",
+                "shape": f"matched×4 → scalar",
+                "hp": {"reduction": "sum / num_gts"},
+                "owner": _source_ref(criterion),
+                "doc": "L1 coordinate error between matched predicted boxes and ground-truth boxes.",
+            },
+            {
+                "name": "GIoU",
+                "kind": "box",
+                "input_from": "decode",
+                "detail": "1 − GIoU",
+                "shape": f"matched×4 → scalar",
+                "hp": {"reduction": "sum / num_gts"},
+                "owner": _source_ref(criterion),
+                "doc": "Generalized IoU loss on matched predicted and ground-truth boxes.",
+            },
+            {
+                "name": "VFL",
+                "kind": "cls",
+                "input_from": "cls",
+                "detail": "varifocal class loss",
+                "shape": f"B×{total_anchors}×{nc} → scalar",
+                "hp": {"use_vfl": True, "nc": nc},
+                "owner": _source_ref(criterion),
+                "doc": "IoU-weighted varifocal classification loss over decoder query logits.",
+            },
         ]
     else:
         if not hasattr(model, "args"):
@@ -175,36 +220,110 @@ def learning_loop(model: DetectionModel) -> dict:
         trainer, validator = DetectionTrainer, DetectionValidator
         assigner_obj = getattr(inner, "assigner", None)
         assigner_name = f"TAL · {type(assigner_obj).__name__}" if assigner_obj else "TAL · TaskAlignedAssigner"
-        reg_max = getattr(head, "reg_max", 1)
+        reg_max = int(getattr(head, "reg_max", 1))
         use_dfl = bool(getattr(inner, "use_dfl", reg_max > 1))
         has_e2e = hasattr(criterion, "one2one")
+        assigner_hp = {
+            k: getattr(assigner_obj, k)
+            for k in ("topk", "alpha", "beta", "num_classes")
+            if assigner_obj is not None and hasattr(assigner_obj, k)
+        }
+        assigner_info = {
+            "name": assigner_name + (" (one2many + one2one)" if has_e2e else ""),
+            "shape": f"B×{total_anchors}×4 + B×{total_anchors}×{nc} → fg_mask, target_bboxes, target_scores",
+            "hp": assigner_hp,
+            "owner": _source_ref(assigner_obj) if assigner_obj is not None else _source_ref(criterion),
+            "doc": "Aligns classification score and IoU (s^alpha * u^beta) to select top-k positive anchors per GT.",
+        }
+        if has_e2e:
+            assigner_name += " (one2many + one2one)"
         decode = (
-            {"name": "DFL · dist2bbox", "detail": f"softmax(reg_max={reg_max}) → xyxy"}
+            {
+                "name": "DFL · dist2bbox",
+                "detail": f"softmax(reg_max={reg_max}) → xyxy",
+                "shape": f"B×{total_anchors}×{4 * reg_max} → B×{total_anchors}×4",
+                "hp": {"reg_max": reg_max, "anchors": total_anchors},
+                "owner": _source_ref(getattr(head, "dfl", head)),
+                "doc": "Applies softmax over reg_max bins per side (l,t,r,b), expects over 0..reg_max-1, and decodes to xyxy boxes.",
+            }
             if use_dfl
-            else {"name": "dist2bbox", "detail": "ltrb → xyxy"}
+            else {
+                "name": "dist2bbox",
+                "detail": "ltrb → xyxy",
+                "shape": f"B×{total_anchors}×4 → B×{total_anchors}×4",
+                "hp": {"reg_max": reg_max, "anchors": total_anchors},
+                "owner": _source_ref(head),
+                "doc": "Converts predicted (l, t, r, b) distances directly to (x1, y1, x2, y2) boxes.",
+            }
         )
         branches = [
             {
                 "name": name,
-                "box": f"box dist (4 × {reg_max})" if use_dfl else "box regression (4)",
-                "cls": "class logits",
+                "stride": s,
+                "anchors": a,
+                "box": f"4×{reg_max}={4 * reg_max}ch" if use_dfl else "4ch",
+                "cls": f"{nc}ch",
             }
-            for name in level_names
+            for name, s, a in zip(level_names, stride_vals, level_anchors)
         ]
-        losses = [{"name": "CIoU", "kind": "box", "detail": "BboxLoss: 1 − CIoU"}]
+        bbox_owner = getattr(inner, "bbox_loss", criterion)
+        cls_obj = getattr(inner, "bce", None)
+        cls_name = type(cls_obj).__name__ if cls_obj else "BCE"
+        hyp = getattr(inner, "hyp", model.args)
+        losses = [
+            {
+                "name": "CIoU",
+                "kind": "box",
+                "input_from": "decode",
+                "detail": "BboxLoss: 1 − CIoU",
+                "shape": "fg×4 (decoded xyxy) → scalar",
+                "hp": {"gain": getattr(hyp, "box", 7.5)},
+                "owner": _source_ref(bbox_owner),
+                "doc": "Complete IoU loss computed on foreground decoded boxes vs TAL target_bboxes.",
+            }
+        ]
         if use_dfl:
-            losses.append({"name": "DFL", "kind": "box", "detail": f"distribution focal · reg_max={reg_max}"})
-        cls_name = type(getattr(inner, "bce", None)).__name__ if getattr(inner, "bce", None) else "BCE"
-        losses.append({"name": "BCE", "kind": "cls", "detail": f"{cls_name} vs TAL scores"})
-        if has_e2e:
-            assigner_name += " (one2many + one2one)"
+            losses.append(
+                {
+                    "name": "DFL",
+                    "kind": "box",
+                    "input_from": "raw_box",
+                    "detail": f"distribution focal · reg_max={reg_max}",
+                    "shape": f"fg×4×{reg_max} (raw logits) → scalar",
+                    "hp": {"reg_max": reg_max, "gain": getattr(hyp, "dfl", 1.5)},
+                    "owner": _source_ref(bbox_owner),
+                    "doc": "Cross-entropy on raw cv2 distribution logits against target ltrb bin weights (before dist2bbox).",
+                }
+            )
+        losses.append(
+            {
+                "name": "BCE",
+                "kind": "cls",
+                "input_from": "cls",
+                "detail": f"{cls_name} vs TAL scores",
+                "shape": f"B×{total_anchors}×{nc} → scalar",
+                "hp": {"gain": getattr(hyp, "cls", 0.5), "nc": nc},
+                "owner": _source_ref(cls_obj) if cls_obj is not None else _source_ref(criterion),
+                "doc": "Binary cross-entropy on raw cv3 class logits against IoU-weighted TAL target_scores.",
+            }
+        )
 
     return {
         "task": "detect",
         "model": _source_ref(model),
         "criterion": _source_ref(criterion),
         "losses": losses,
-        "head_graph": {"name": head_name, "levels": branches, "decode": decode, "assigner": assigner_name},
+        "head_graph": {
+            "name": head_name,
+            "nl": levels,
+            "nc": nc,
+            "reg_max": reg_max,
+            "anchors": total_anchors,
+            "levels": branches,
+            "decode": decode,
+            "assigner": assigner_name,
+            "assigner_info": assigner_info,
+        },
         "trainer": _source_ref(trainer),
         "validator": _source_ref(validator),
         "metric": TASK2METRIC["detect"],

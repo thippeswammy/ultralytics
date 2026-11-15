@@ -46,6 +46,13 @@ def test_learning_graph_is_derived_from_real_head(
     assert loss_names >= expected_losses
     assert loss_names.isdisjoint(absent_losses)
     assert graph["head_graph"]["assigner"].startswith(assigner)
+    by_name = {x["name"]: x for x in graph["losses"]}
+    if "DFL" in by_name:
+        assert by_name["DFL"]["input_from"] == "raw_box"
+    if "CIoU" in by_name:
+        assert by_name["CIoU"]["input_from"] == "decode"
+    if "BCE" in by_name:
+        assert by_name["BCE"]["input_from"] == "cls"
 
 
 def test_template_renders_learning_graph_inside_final_head_card():
