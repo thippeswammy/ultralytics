@@ -2416,6 +2416,16 @@
           : `<p class="muted" style="font-size:12px">This file defines one model size, so shapes are literal. GFLOPs count conv + linear layers at ${DATA.imgsz}×${DATA.imgsz}.</p>`;
         return h;
       }
+      function learningHTML(cfg) {
+        const l = cfg.learning;
+        if (!l) return "";
+        const ref = (x) =>
+          `<span class="mono">${esc(x.name)}</span>${x.file ? ` <span class="muted">(${esc(x.file)}:${x.line})</span>` : ""}`;
+        let h = `<h3>Learning loop</h3><p class="muted" style="font-size:12px">These components are resolved from the built model and task registry, so the connection follows the implementation used by this version.</p>`;
+        h += `<table><tr><th>stage</th><th>owner</th></tr>${l.steps.map((s) => `<tr><td>${esc(s.name)}</td><td>${ref(s.owner)}</td></tr>`).join("")}</table>`;
+        h += `<p style="font-size:12px"><b>Loss:</b> ${ref(l.criterion)}<br><b>Loss components:</b> ${l.losses.length ? l.losses.map(ref).join(", ") : "model-specific internal terms"}<br><b>Validation:</b> ${ref(l.validator)}<br><b>Metric:</b> <span class="mono">${esc(l.metric)}</span> · <b>dataset:</b> <span class="mono">${esc(l.dataset)}</span></p>`;
+        return h;
+      }
       // training vs deployment: interpretation plus the differences the build found in module paths and traces
       function phaseHTML(cfg) {
         const ph = S.phase === "train" ? "deploy" : S.phase;
@@ -2521,7 +2531,7 @@
                             <p class="muted">Click any block — in the overview or the diagram — to open its internals beside the diagram; click blocks inside a card to keep going deeper.</p>
                             ${newBlocks.length ? `<h3>Blocks new in ${esc(cfg.version)}</h3><p>${newBlocks.map((b) => `<button class="chip" data-blk="${b}">${b}</button>`).join(" ")}</p>` : ""}
                             ${phaseHTML(cfg)}
-                            <h3>Scales · ${PHASE_LABEL[S.phase]}</h3>${scaleTable(cfg)}<h3>Legend</h3>${legendHTML()}
+                            ${learningHTML(cfg)}<h3>Scales · ${PHASE_LABEL[S.phase]}</h3>${scaleTable(cfg)}<h3>Legend</h3>${legendHTML()}
                             <details><summary>YAML config</summary><pre class="code">${hl(cfg.yaml)}</pre></details>`;
           }
         }

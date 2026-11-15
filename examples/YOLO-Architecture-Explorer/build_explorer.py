@@ -124,6 +124,46 @@ def build_model(path: Path, scale: str | None):
     return model.eval(), rows
 
 
+def _source_ref(obj) -> dict:
+    """Return a compact source reference for a runtime training component."""
+    cls = obj if isinstance(obj, type) else type(obj)
+    try:
+        file = str(Path(inspect.getsourcefile(cls)).resolve().relative_to(REPO))
+        line = inspect.getsourcelines(cls)[1]
+    except (TypeError, OSError, ValueError):
+        file, line = None, None
+    return {"name": cls.__name__, "module": cls.__module__, "file": file, "line": line}
+
+
+def learning_loop(model: DetectionModel) -> dict:
+    """Describe the actual training components selected by this model."""
+    from ultralytics.cfg import TASK2DATA, TASK2METRIC
+    from ultralytics.engine.trainer import BaseTrainer
+    from ultralytics.models.yolo.detect.train import DetectionTrainer
+    from ultralytics.models.yolo.detect.val import DetectionValidator
+    from ultralytics.utils.loss import E2ELoss, v8DetectionLoss
+
+    # DetectionModel.init_criterion() needs trainer-populated hyperparameters; selecting its exact branch from the
+    # same condition avoids constructing a partial training object during architecture discovery.
+    criterion = E2ELoss if getattr(model.model[-1], "one2one_cv2", None) is not None else v8DetectionLoss
+    return {
+        "task": "detect",
+        "model": _source_ref(model),
+        "criterion": _source_ref(criterion),
+        "losses": [],
+        "trainer": _source_ref(DetectionTrainer),
+        "validator": _source_ref(DetectionValidator),
+        "metric": TASK2METRIC["detect"],
+        "dataset": TASK2DATA["detect"],
+        "steps": [
+            {"name": "forward", "owner": _source_ref(model)},
+            {"name": "loss", "owner": _source_ref(criterion)},
+            {"name": "backward + optimizer", "owner": _source_ref(BaseTrainer)},
+            {"name": "validation metric", "owner": _source_ref(DetectionValidator)},
+        ],
+    }
+
+
 # --------------------------------------------------------------------------------------------------------------------
 # graph processing: collapse repeats, structural keys, samples for fitting
 # --------------------------------------------------------------------------------------------------------------------
@@ -817,6 +857,7 @@ def run(only: str | None):
             continue
         sc = cfg["scales"]
         first_model = next(iter(per_scale.values()))[0]
+        cfg["learning"] = learning_loop(first_model)
         entries = raw["backbone"] + raw["head"]
         for i, layer in enumerate(first_model.model):
             f, yaml_n, mod_name, yaml_args = entries[i]
