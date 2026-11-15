@@ -2119,6 +2119,29 @@
       const CARD_GAP = 56,
         HDR = 46,
         PAD = 18;
+      function learningCardLayout(cfg, layer) {
+        const graph = cfg.learning?.head_graph;
+        if (!graph) return null;
+        const nodes = [], edges = [], W = 150, H = 48, gap = 18;
+        const add = (id, title, sub, x, y, fam = "head") =>
+          nodes.push({ id, j: id, title, sub, x, y, w: W, h: H, fam, kind: "learning", ctx: {} });
+        const addEdge = (s, t) => edges.push({ s, t, d: `M${nodes[s].x + W / 2},${nodes[s].y + H} L${nodes[t].x + W / 2},${nodes[t].y}`, lx: nodes[s].x + W / 2, ly: (nodes[s].y + H + nodes[t].y) / 2 });
+        graph.levels.forEach((v, i) => {
+          add(i, `${v.name} · box`, v.box, i * (W + gap), 0, "head");
+          add(graph.levels.length + i, `${v.name} · cls`, v.cls, i * (W + gap), H + 24, "conv");
+          addEdge(i, graph.levels.length + i);
+        });
+        const tx = ((graph.levels.length - 1) * (W + gap)) / 2;
+        const tal = nodes.length;
+        add(tal, graph.assigner, "target assignment", tx, 2 * (H + 24), "attn");
+        graph.levels.forEach((_, i) => addEdge(graph.levels.length + i, tal));
+        const firstLoss = nodes.length;
+        graph.losses.forEach((v, i) => {
+          add(firstLoss + i, v.name, v.detail, i * (W + gap), 3 * (H + 24), v.kind === "cls" ? "conv" : "head");
+          addEdge(tal, firstLoss + i);
+        });
+        return { nodes, edges, w: Math.max(W, graph.levels.length * (W + gap) - gap), h: 4 * (H + 24) };
+      }
       function drawCards(g, x0, y0) {
         const cfg = cfgById[S.cfg];
         let x = x0;
@@ -2126,7 +2149,10 @@
         const twins = twinChain(S.cards),
           io = ioLabels(S.cards);
         S.cards.forEach((c, ci) => {
-          const lay = layoutBlock(c.key, S.cfg, `c${ci}_`, { card: ci, layer: c.layer }, io[ci]);
+          const layer = c.layer != null ? cfg.layers[c.layer] : null;
+          const lay = layer?.i === cfg.layers.length - 1 && cfg.learning?.head_graph
+            ? learningCardLayout(cfg, layer)
+            : layoutBlock(c.key, S.cfg, `c${ci}_`, { card: ci, layer: c.layer }, io[ci]);
           const nOnly = markOnly(lay.nodes, c.key, twins[ci]);
           for (const n of lay.nodes) {
             n.isOpen = S.cards[ci + 1]?.from === n.j;
@@ -2136,7 +2162,6 @@
             }
           }
           const b = DATA.blocks[c.key];
-          const layer = c.layer != null ? cfg.layers[c.layer] : null;
           const variants = layer && V(layer).length > 1 ? V(layer) : [];
           const subT =
             (ci === 0
@@ -2424,7 +2449,7 @@
         const box = (label, text, cls = "") => `<div style="border:1px solid #9aa8b5;border-radius:6px;padding:7px 9px;background:var(--${cls || "head"});min-width:110px;text-align:center"><b>${esc(label)}</b><br><span class="muted" style="font-size:11px">${esc(text)}</span></div>`;
         let h = `<h3>Learning graph · ${esc(l.head_graph.name)}</h3><p class="muted" style="font-size:12px">Separate from inference: each detection level stays distinct, then feeds the shared target assignment and named loss terms actually used by this criterion.</p>`;
         h += `<div style="display:flex;align-items:center;gap:7px;overflow-x:auto;padding:6px 0">`;
-        h += l.head_graph.levels.map((x) => `<div style="display:flex;align-items:center;gap:7px">${box(x.name, x.box, "head")}<span>→</span>${box("cls", x.cls, "conv")}</div>`).join("<span style='padding:0 3px">＋</span>");
+        h += l.head_graph.levels.map((x) => `<div style="display:flex;align-items:center;gap:7px">${box(x.name, x.box, "head")}<span>→</span>${box("cls", x.cls, "conv")}</div>`).join(`<span style="padding:0 3px">＋</span>`);
         h += `<span>→</span>${box("TAL", l.head_graph.assigner, "attn")}<span>→</span><div style="display:grid;grid-template-columns:repeat(3,minmax(105px,1fr));gap:6px">${l.losses.map((x) => box(x.name, x.detail, x.kind === "cls" ? "conv" : "head")).join("")}</div></div>`;
         h += `<p style="font-size:12px"><b>Criterion:</b> ${ref(l.criterion)} · <b>Validation:</b> ${ref(l.validator)} · <b>Metric:</b> <span class="mono">${esc(l.metric)}</span> · <b>dataset:</b> <span class="mono">${esc(l.dataset)}</span></p>`;
         h += `<details><summary>Training method owners</summary><table><tr><th>stage</th><th>owner</th></tr>${l.steps.map((s) => `<tr><td>${esc(s.name)}</td><td>${ref(s.owner)}</td></tr>`).join("")}</table></details>`;
