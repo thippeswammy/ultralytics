@@ -146,11 +146,28 @@ def learning_loop(model: DetectionModel) -> dict:
     # DetectionModel.init_criterion() needs trainer-populated hyperparameters; selecting its exact branch from the
     # same condition avoids constructing a partial training object during architecture discovery.
     criterion = E2ELoss if getattr(model.model[-1], "one2one_cv2", None) is not None else v8DetectionLoss
+    head = model.model[-1]
+    head_name = type(head).__name__
+    levels = getattr(head, "nl", len(getattr(head, "cv2", [])))
+    branches = [
+        {
+            "name": f"P{i + 3}",
+            "box": "box distribution (4 × reg_max)" if getattr(head, "reg_max", 1) > 1 else "box regression",
+            "cls": "class logits",
+        }
+        for i in range(levels)
+    ]
+    losses = [
+        {"name": "CIoU", "kind": "box", "detail": "BboxLoss: 1 − CIoU"},
+        {"name": "DFL", "kind": "box", "detail": f"distribution focal loss · reg_max={getattr(head, 'reg_max', 1)}"},
+        {"name": "BCE", "kind": "cls", "detail": "classification logits vs TAL target scores"},
+    ]
     return {
         "task": "detect",
         "model": _source_ref(model),
         "criterion": _source_ref(criterion),
-        "losses": [],
+        "losses": losses,
+        "head_graph": {"name": head_name, "levels": branches, "assigner": "TAL · TaskAlignedAssigner"},
         "trainer": _source_ref(DetectionTrainer),
         "validator": _source_ref(DetectionValidator),
         "metric": TASK2METRIC["detect"],

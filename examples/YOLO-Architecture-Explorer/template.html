@@ -2421,9 +2421,13 @@
         if (!l) return "";
         const ref = (x) =>
           `<span class="mono">${esc(x.name)}</span>${x.file ? ` <span class="muted">(${esc(x.file)}:${x.line})</span>` : ""}`;
-        let h = `<h3>Learning loop</h3><p class="muted" style="font-size:12px">These components are resolved from the built model and task registry, so the connection follows the implementation used by this version.</p>`;
-        h += `<table><tr><th>stage</th><th>owner</th></tr>${l.steps.map((s) => `<tr><td>${esc(s.name)}</td><td>${ref(s.owner)}</td></tr>`).join("")}</table>`;
-        h += `<p style="font-size:12px"><b>Loss:</b> ${ref(l.criterion)}<br><b>Loss components:</b> ${l.losses.length ? l.losses.map(ref).join(", ") : "model-specific internal terms"}<br><b>Validation:</b> ${ref(l.validator)}<br><b>Metric:</b> <span class="mono">${esc(l.metric)}</span> · <b>dataset:</b> <span class="mono">${esc(l.dataset)}</span></p>`;
+        const box = (label, text, cls = "") => `<div style="border:1px solid #9aa8b5;border-radius:6px;padding:7px 9px;background:var(--${cls || "head"});min-width:110px;text-align:center"><b>${esc(label)}</b><br><span class="muted" style="font-size:11px">${esc(text)}</span></div>`;
+        let h = `<h3>Learning graph · ${esc(l.head_graph.name)}</h3><p class="muted" style="font-size:12px">Separate from inference: each detection level stays distinct, then feeds the shared target assignment and named loss terms actually used by this criterion.</p>`;
+        h += `<div style="display:flex;align-items:center;gap:7px;overflow-x:auto;padding:6px 0">`;
+        h += l.head_graph.levels.map((x) => `<div style="display:flex;align-items:center;gap:7px">${box(x.name, x.box, "head")}<span>→</span>${box("cls", x.cls, "conv")}</div>`).join("<span style='padding:0 3px">＋</span>");
+        h += `<span>→</span>${box("TAL", l.head_graph.assigner, "attn")}<span>→</span><div style="display:grid;grid-template-columns:repeat(3,minmax(105px,1fr));gap:6px">${l.losses.map((x) => box(x.name, x.detail, x.kind === "cls" ? "conv" : "head")).join("")}</div></div>`;
+        h += `<p style="font-size:12px"><b>Criterion:</b> ${ref(l.criterion)} · <b>Validation:</b> ${ref(l.validator)} · <b>Metric:</b> <span class="mono">${esc(l.metric)}</span> · <b>dataset:</b> <span class="mono">${esc(l.dataset)}</span></p>`;
+        h += `<details><summary>Training method owners</summary><table><tr><th>stage</th><th>owner</th></tr>${l.steps.map((s) => `<tr><td>${esc(s.name)}</td><td>${ref(s.owner)}</td></tr>`).join("")}</table></details>`;
         return h;
       }
       // training vs deployment: interpretation plus the differences the build found in module paths and traces
