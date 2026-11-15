@@ -19,6 +19,7 @@ import hashlib
 import inspect
 import json
 import logging
+import math
 import re
 import sys
 import time
@@ -137,46 +138,82 @@ def _source_ref(obj) -> dict:
 
 def learning_loop(model: DetectionModel) -> dict:
     """Describe the actual training components selected by this model."""
-    from ultralytics.cfg import TASK2DATA, TASK2METRIC
+    from ultralytics.cfg import DEFAULT_CFG, TASK2DATA, TASK2METRIC, get_cfg
     from ultralytics.engine.trainer import BaseTrainer
+    from ultralytics.models.rtdetr.train import RTDETRTrainer
+    from ultralytics.models.rtdetr.val import RTDETRValidator
+    from ultralytics.models.utils.loss import RTDETRDetectionLoss
     from ultralytics.models.yolo.detect.train import DetectionTrainer
     from ultralytics.models.yolo.detect.val import DetectionValidator
-    from ultralytics.utils.loss import E2ELoss, v8DetectionLoss
 
-    # DetectionModel.init_criterion() needs trainer-populated hyperparameters; selecting its exact branch from the
-    # same condition avoids constructing a partial training object during architecture discovery.
-    criterion = E2ELoss if getattr(model.model[-1], "one2one_cv2", None) is not None else v8DetectionLoss
     head = model.model[-1]
     head_name = type(head).__name__
-    levels = getattr(head, "nl", len(getattr(head, "cv2", [])))
-    branches = [
-        {
-            "name": f"P{i + 3}",
-            "box": "box distribution (4 × reg_max)" if getattr(head, "reg_max", 1) > 1 else "box regression",
-            "cls": "class logits",
-        }
-        for i in range(levels)
-    ]
-    losses = [
-        {"name": "CIoU", "kind": "box", "detail": "BboxLoss: 1 − CIoU"},
-        {"name": "DFL", "kind": "box", "detail": f"distribution focal loss · reg_max={getattr(head, 'reg_max', 1)}"},
-        {"name": "BCE", "kind": "cls", "detail": "classification logits vs TAL target scores"},
-    ]
+    is_rtdetr = head_name == "RTDETRDecoder"
+    levels = getattr(head, "nl", len(getattr(head, "cv2", getattr(head, "strides", [])))) or 3
+    strides = getattr(head, "stride", getattr(head, "strides", None))
+    if strides is not None and len(strides) == levels:
+        level_names = [f"P{round(math.log2(float(s)))}" for s in strides]
+    else:
+        level_names = [f"P{i + 3}" for i in range(levels)]
+
+    if is_rtdetr:
+        criterion = RTDETRDetectionLoss(nc=getattr(head, "nc", model.yaml.get("nc", 80)), use_vfl=True)
+        trainer, validator = RTDETRTrainer, RTDETRValidator
+        assigner_name = type(criterion.matcher).__name__
+        decode = None
+        branches = [{"name": name, "box": "query box (cx,cy,w,h)", "cls": "query class logits"} for name in level_names]
+        losses = [
+            {"name": "L1", "kind": "box", "detail": "Bbox L1 loss"},
+            {"name": "GIoU", "kind": "box", "detail": "1 − GIoU"},
+            {"name": "VFL", "kind": "cls", "detail": "varifocal class loss"},
+        ]
+    else:
+        if not hasattr(model, "args"):
+            model.args = get_cfg(DEFAULT_CFG)
+        criterion = model.init_criterion()
+        inner = getattr(criterion, "one2many", criterion)
+        trainer, validator = DetectionTrainer, DetectionValidator
+        assigner_obj = getattr(inner, "assigner", None)
+        assigner_name = f"TAL · {type(assigner_obj).__name__}" if assigner_obj else "TAL · TaskAlignedAssigner"
+        reg_max = getattr(head, "reg_max", 1)
+        use_dfl = bool(getattr(inner, "use_dfl", reg_max > 1))
+        has_e2e = hasattr(criterion, "one2one")
+        decode = (
+            {"name": "DFL · dist2bbox", "detail": f"softmax(reg_max={reg_max}) → xyxy"}
+            if use_dfl
+            else {"name": "dist2bbox", "detail": "ltrb → xyxy"}
+        )
+        branches = [
+            {
+                "name": name,
+                "box": f"box dist (4 × {reg_max})" if use_dfl else "box regression (4)",
+                "cls": "class logits",
+            }
+            for name in level_names
+        ]
+        losses = [{"name": "CIoU", "kind": "box", "detail": "BboxLoss: 1 − CIoU"}]
+        if use_dfl:
+            losses.append({"name": "DFL", "kind": "box", "detail": f"distribution focal · reg_max={reg_max}"})
+        cls_name = type(getattr(inner, "bce", None)).__name__ if getattr(inner, "bce", None) else "BCE"
+        losses.append({"name": "BCE", "kind": "cls", "detail": f"{cls_name} vs TAL scores"})
+        if has_e2e:
+            assigner_name += " (one2many + one2one)"
+
     return {
         "task": "detect",
         "model": _source_ref(model),
         "criterion": _source_ref(criterion),
         "losses": losses,
-        "head_graph": {"name": head_name, "levels": branches, "assigner": "TAL · TaskAlignedAssigner"},
-        "trainer": _source_ref(DetectionTrainer),
-        "validator": _source_ref(DetectionValidator),
+        "head_graph": {"name": head_name, "levels": branches, "decode": decode, "assigner": assigner_name},
+        "trainer": _source_ref(trainer),
+        "validator": _source_ref(validator),
         "metric": TASK2METRIC["detect"],
         "dataset": TASK2DATA["detect"],
         "steps": [
             {"name": "forward", "owner": _source_ref(model)},
             {"name": "loss", "owner": _source_ref(criterion)},
             {"name": "backward + optimizer", "owner": _source_ref(BaseTrainer)},
-            {"name": "validation metric", "owner": _source_ref(DetectionValidator)},
+            {"name": "validation metric", "owner": _source_ref(validator)},
         ],
     }
 
